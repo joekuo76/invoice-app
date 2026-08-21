@@ -1,0 +1,4 @@
+google-genai
+streamlit
+openpyxl
+pillow
