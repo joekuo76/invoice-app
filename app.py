@@ -12,7 +12,7 @@ import streamlit as st
 st.set_page_config(page_title="請款單自動生成系統", layout="wide")
 st.title("🧾 請款單自動生成工具")
 
-# --- 自動讀取 API Key (優先讀取 Streamlit Secrets) ---
+# --- 自動讀取 API Key ---
 api_key = ""
 if "GEMINI_API_KEY" in st.secrets:
   api_key = st.secrets["GEMINI_API_KEY"]
@@ -34,11 +34,17 @@ with st.sidebar:
     st.success("✅ API Key 已自動載入")
 
 
-def parse_receipt(
-    image_bytes: bytes, client: genai.Client, max_retries: int = 3
-) -> dict:
-  """呼叫 Gemini 辨識發票/收據照片（含 503 尖峰自動重試機制）"""
+def parse_receipt(image_bytes: bytes, client: genai.Client) -> dict:
+  """呼叫 Gemini 辨識發票/收據照片（具備雙模型備援與重試）"""
   image = Image.open(io.BytesIO(image_bytes))
+
+  # 遇到 503 尖峰時，自動按順序切換備援模型
+  candidate_models = [
+      "gemini-2.5-flash",
+      "gemini-2.0-flash",
+      "gemini-1.5-flash",
+  ]
+
   prompt = """
     你是一位專業的會計助理，請辨識此單據/發票/收據照片的資訊。
     請嚴格依照 JSON 格式輸出（不要輸出 Markdown 區塊或額外文字）：
@@ -51,25 +57,26 @@ def parse_receipt(
     }
     """
 
-  for attempt in range(max_retries):
-    try:
-      response = client.models.generate_content(
-          model="gemini-2.5-flash",
-          contents=[image, prompt],
-          config=types.GenerateContentConfig(
-              response_mime_type="application/json",
-              temperature=0.1,
-          ),
-      )
-      return json.loads(response.text)
-    except Exception as e:
-      # 遭遇 503 (尖峰繁忙) 或 429 (請求過快) 自動退避等待後重試
-      if (
-          "503" in str(e) or "429" in str(e) or "UNAVAILABLE" in str(e)
-      ) and attempt < max_retries - 1:
-        time.sleep(2 * (attempt + 1))
+  last_error = None
+  for model_name in candidate_models:
+    for attempt in range(2):
+      try:
+        response = client.models.generate_content(
+            model=model_name,
+            contents=[image, prompt],
+            config=types.GenerateContentConfig(
+                response_mime_type="application/json",
+                temperature=0.1,
+            ),
+        )
+        return json.loads(response.text)
+      except Exception as e:
+        last_error = e
+        time.sleep(1.5)  # 等待 1.5 秒後換模型或重試
         continue
-      raise e
+
+  # 若三個模型節點都嘗試失敗才拋出
+  raise last_error
 
 
 def write_to_excel(
@@ -162,7 +169,7 @@ if uploaded_files:
           try:
             res = parse_receipt(uploaded_file.getvalue(), client)
             parsed_results.append(res)
-            time.sleep(1)  # 避開 API 連續頻率限制
+            time.sleep(1)
           except Exception as e:
             st.error(f"檔案 {uploaded_file.name} 辨識失敗: {e}")
         progress_bar.progress((i + 1) / len(uploaded_files))
@@ -177,7 +184,6 @@ if "parsed_results" in st.session_state:
       st.session_state["parsed_results"], num_rows="dynamic", use_container_width=True
   )
 
-  # 自動偵測範本檔名
   template_target = (
       "template.xlsx" if os.path.exists("template.xlsx") else "template.xls"
   )
@@ -201,6 +207,6 @@ if "parsed_results" in st.session_state:
         )
     except Exception as err:
       st.error(
-          f"產出失敗: {err}（請確認範本為 .xlsx 格式，若為舊版 .xls 請在 Excel 另存為"
-          " .xlsx 後上傳）"
+          f"產出失敗: {err}（請確認範本為 .xlsx 格式，若為舊版 .xls 請另存為 .xlsx"
+          " 後上傳）"
       )
