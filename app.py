@@ -1,5 +1,6 @@
 import io
 import json
+import os
 from google import genai
 from google.genai import types
 import openpyxl
@@ -10,12 +11,26 @@ import streamlit as st
 st.set_page_config(page_title="請款單自動生成系統", layout="wide")
 st.title("🧾 請款單自動生成工具")
 
-# 側邊欄：設定 API Key
+# --- 自動讀取 API Key (優先從 Streamlit Secrets 讀取) ---
+api_key = ""
+if "GEMINI_API_KEY" in st.secrets:
+  api_key = st.secrets["GEMINI_API_KEY"]
+elif os.environ.get("GEMINI_API_KEY"):
+  api_key = os.environ.get("GEMINI_API_KEY")
+
+# 側邊欄設定
 with st.sidebar:
   st.header("⚙️ 系統設定")
-  api_key = st.text_input("請輸入 Gemini API Key", type="password")
   applicant_name = st.text_input("請款人姓名", value="")
   department = st.text_input("請款單位", value="")
+
+  if not api_key:
+    api_key = st.text_input(
+        "Gemini API Key (未偵測到後台設定，請手動輸入)",
+        type="password",
+    )
+  else:
+    st.success("✅ API Key 已自動載入")
 
 
 def parse_receipt(image_bytes: bytes, client: genai.Client) -> dict:
@@ -54,7 +69,6 @@ def write_to_excel(
   wb = openpyxl.load_workbook(template_path)
   ws = wb.active
 
-  # 填入基本資訊
   if dept:
     ws["B3"] = dept
 
@@ -68,7 +82,6 @@ def write_to_excel(
   center_align = Alignment(horizontal="center", vertical="center")
   right_align = Alignment(horizontal="right", vertical="center")
 
-  # 寫入每筆明細
   for idx, item in enumerate(items):
     row = start_row + idx
     ws.cell(
@@ -90,7 +103,6 @@ def write_to_excel(
     for col in range(1, 8):
       ws.cell(row=row, column=col).border = thin_border
 
-  # 合計欄位
   total_row = start_row + len(items)
   ws.cell(row=total_row, column=1, value="合    計").alignment = (
       center_align
@@ -102,7 +114,6 @@ def write_to_excel(
   for col in range(1, 8):
     ws.cell(row=total_row, column=col).border = thin_border
 
-  # 底部簽核列
   sign_row = total_row + 2
   roles = ["總經理", "", "出納", "", "會計", "主管", "請款人"]
   for col_idx, role in enumerate(roles, start=1):
@@ -117,7 +128,6 @@ def write_to_excel(
   wb.save(output_path)
 
 
-# 檔案上傳介面
 uploaded_files = st.file_uploader(
     "上傳發票或收據照片 (可多選)",
     type=["jpg", "jpeg", "png"],
@@ -126,7 +136,7 @@ uploaded_files = st.file_uploader(
 
 if uploaded_files:
   if not api_key:
-    st.warning("⚠️ 請先在左側欄位輸入 Gemini API Key！")
+    st.warning("⚠️ 請先設定 Gemini API Key！")
   else:
     if st.button("🚀 開始辨識單據並生成請款單"):
       client = genai.Client(api_key=api_key)
@@ -146,23 +156,35 @@ if uploaded_files:
         st.session_state["parsed_results"] = parsed_results
         st.success("🎉 辨識完成！")
 
-# 編輯與校對區
 if "parsed_results" in st.session_state:
   st.subheader("📋 辨識結果確認與微調")
   edited_data = st.data_editor(
       st.session_state["parsed_results"], num_rows="dynamic", use_container_width=True
   )
 
+  # 判斷範本存在性（相容 template.xlsx 或 template.xls）
+  template_target = (
+      "template.xlsx" if os.path.exists("template.xlsx") else "template.xls"
+  )
   output_filename = "請款單_產出.xlsx"
-  if st.button("💾 確認產出 Excel"):
-    write_to_excel(
-        edited_data, "template.xlsx", output_filename, department, applicant_name
-    )
 
-    with open(output_filename, "rb") as f:
-      st.download_button(
-          label="📥 下載完成的請款單 Excel",
-          data=f,
-          file_name="請款單.xlsx",
-          mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+  if st.button("💾 確認產出 Excel"):
+    try:
+      write_to_excel(
+          edited_data,
+          template_target,
+          output_filename,
+          department,
+          applicant_name,
+      )
+      with open(output_filename, "rb") as f:
+        st.download_button(
+            label="📥 下載完成的請款單 Excel",
+            data=f,
+            file_name="請款單.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
+    except Exception as err:
+      st.error(
+          f"產出失敗: {err}（請確認範本是否為標準 .xlsx 格式，若為 .xls 請另存為 .xlsx 後上傳）"
       )
