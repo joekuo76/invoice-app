@@ -27,21 +27,30 @@ with st.sidebar:
 
   if not api_key:
     api_key = st.text_input(
-        "Gemini API Key (未設定 Secrets 時可在此手動輸入)",
-        type="password",
+        "Gemini API Key (未設定 Secrets 時可手動輸入)", type="password"
     )
   else:
     st.success("✅ API Key 已自動載入")
 
 
+def compress_image(image_bytes: bytes) -> Image.Image:
+  """將手機大圖等比例縮小，大幅減輕 API 傳輸負擔並避免 503 伺服器超載"""
+  img = Image.open(io.BytesIO(image_bytes))
+  if img.mode != "RGB":
+    img = img.convert("RGB")
+
+  # 最大邊長限制在 1200px 內，對文字辨識已非常足夠
+  max_size = 1200
+  if max(img.size) > max_size:
+    img.thumbnail((max_size, max_size), Image.Resampling.LANCZOS)
+  return img
+
+
 def parse_receipt(
     image_bytes: bytes, client: genai.Client, max_retries: int = 4
 ) -> dict:
-  """呼叫 Gemini 辨識發票/收據照片（針對 503 尖峰自動退避等待）"""
-  image = Image.open(io.BytesIO(image_bytes))
-
-  # 採用官方相容標準模型清單
-  models_to_try = ["gemini-2.5-flash", "gemini-2.0-flash"]
+  """呼叫 Gemini 辨識發票/收據照片"""
+  image = compress_image(image_bytes)
 
   prompt = """
     你是一位專業的會計助理，請辨識此單據/發票/收據照片的資訊。
@@ -55,29 +64,25 @@ def parse_receipt(
     }
     """
 
-  last_error = None
-  for model_name in models_to_try:
-    for attempt in range(max_retries):
-      try:
-        response = client.models.generate_content(
-            model=model_name,
-            contents=[image, prompt],
-            config=types.GenerateContentConfig(
-                response_mime_type="application/json",
-                temperature=0.1,
-            ),
-        )
-        return json.loads(response.text)
-      except Exception as e:
-        last_error = e
-        err_msg = str(e)
-        # 遇 503 (伺服器塞車) 或 429 (次數限制) 進行階梯式延遲重試
-        if "503" in err_msg or "429" in err_msg or "UNAVAILABLE" in err_msg:
-          time.sleep(3 * (attempt + 1))  # 依序等待 3s, 6s, 9s
-          continue
-        break  # 其他錯誤（如格式錯誤）換下一個模型
-
-  raise last_error
+  for attempt in range(max_retries):
+    try:
+      response = client.models.generate_content(
+          model="gemini-2.5-flash",
+          contents=[image, prompt],
+          config=types.GenerateContentConfig(
+              response_mime_type="application/json",
+              temperature=0.1,
+          ),
+      )
+      return json.loads(response.text)
+    except Exception as e:
+      err_msg = str(e)
+      if (
+          "503" in err_msg or "429" in err_msg or "UNAVAILABLE" in err_msg
+      ) and attempt < max_retries - 1:
+        time.sleep(3 * (attempt + 1))
+        continue
+      raise e
 
 
 def write_to_excel(
@@ -170,7 +175,7 @@ if uploaded_files:
           try:
             res = parse_receipt(uploaded_file.getvalue(), client)
             parsed_results.append(res)
-            time.sleep(1.5)  # 每次處理間隔 1.5 秒
+            time.sleep(2)  # 每次處理微停 2 秒確保請求平滑
           except Exception as e:
             st.error(f"檔案 {uploaded_file.name} 辨識失敗: {e}")
         progress_bar.progress((i + 1) / len(uploaded_files))
@@ -207,7 +212,4 @@ if "parsed_results" in st.session_state:
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         )
     except Exception as err:
-      st.error(
-          f"產出失敗: {err}（請確認範本為 .xlsx 格式，若為舊版 .xls 請另存為 .xlsx"
-          " 後上傳）"
-      )
+      st.error(f"產出失敗: {err}")
