@@ -1,4 +1,6 @@
-google-genai
-streamlit
-openpyxl
-pillow
+streamlit>=1.40
+google-genai>=1.0.0
+pydantic>=2.0
+Pillow>=10.0
+openpyxl>=3.1
+pandas>=2.0
