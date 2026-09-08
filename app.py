@@ -34,12 +34,10 @@ with st.sidebar:
 
 
 def compress_image(image_bytes: bytes) -> Image.Image:
-  """將手機大圖等比例縮小，大幅減輕 API 傳輸負擔並避免 503 伺服器超載"""
+  """壓縮圖片以降低傳輸大小並加速辨識"""
   img = Image.open(io.BytesIO(image_bytes))
   if img.mode != "RGB":
     img = img.convert("RGB")
-
-  # 最大邊長限制在 1200px 內，對文字辨識已非常足夠
   max_size = 1200
   if max(img.size) > max_size:
     img.thumbnail((max_size, max_size), Image.Resampling.LANCZOS)
@@ -47,9 +45,9 @@ def compress_image(image_bytes: bytes) -> Image.Image:
 
 
 def parse_receipt(
-    image_bytes: bytes, client: genai.Client, max_retries: int = 4
+    image_bytes: bytes, client: genai.Client, max_retries: int = 3
 ) -> dict:
-  """呼叫 Gemini 辨識發票/收據照片"""
+  """呼叫高免費額度的 gemini-2.0-flash 進行辨識"""
   image = compress_image(image_bytes)
 
   prompt = """
@@ -67,7 +65,7 @@ def parse_receipt(
   for attempt in range(max_retries):
     try:
       response = client.models.generate_content(
-          model="gemini-2.5-flash",
+          model="gemini-2.0-flash",  # 改用高額度、最穩定的 2.0-flash
           contents=[image, prompt],
           config=types.GenerateContentConfig(
               response_mime_type="application/json",
@@ -77,10 +75,11 @@ def parse_receipt(
       return json.loads(response.text)
     except Exception as e:
       err_msg = str(e)
+      # 遭遇 429 或 503 時自動延長冷卻時間
       if (
-          "503" in err_msg or "429" in err_msg or "UNAVAILABLE" in err_msg
+          "429" in err_msg or "503" in err_msg or "RESOURCE_EXHAUSTED" in err_msg
       ) and attempt < max_retries - 1:
-        time.sleep(3 * (attempt + 1))
+        time.sleep(5 * (attempt + 1))
         continue
       raise e
 
@@ -175,7 +174,7 @@ if uploaded_files:
           try:
             res = parse_receipt(uploaded_file.getvalue(), client)
             parsed_results.append(res)
-            time.sleep(2)  # 每次處理微停 2 秒確保請求平滑
+            time.sleep(1)  # 避免連續密集送出
           except Exception as e:
             st.error(f"檔案 {uploaded_file.name} 辨識失敗: {e}")
         progress_bar.progress((i + 1) / len(uploaded_files))
