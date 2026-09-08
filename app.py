@@ -1,6 +1,7 @@
 import io
 import json
 import os
+import time
 from google import genai
 from google.genai import types
 import openpyxl
@@ -11,7 +12,7 @@ import streamlit as st
 st.set_page_config(page_title="請款單自動生成系統", layout="wide")
 st.title("🧾 請款單自動生成工具")
 
-# --- 自動讀取 API Key (優先從 Streamlit Secrets 讀取) ---
+# --- 自動讀取 API Key (優先讀取 Streamlit Secrets) ---
 api_key = ""
 if "GEMINI_API_KEY" in st.secrets:
   api_key = st.secrets["GEMINI_API_KEY"]
@@ -26,15 +27,17 @@ with st.sidebar:
 
   if not api_key:
     api_key = st.text_input(
-        "Gemini API Key (未偵測到後台設定，請手動輸入)",
+        "Gemini API Key (未設定 Secrets 時可在此手動輸入)",
         type="password",
     )
   else:
     st.success("✅ API Key 已自動載入")
 
 
-def parse_receipt(image_bytes: bytes, client: genai.Client) -> dict:
-  """呼叫 Gemini 辨識發票/收據照片"""
+def parse_receipt(
+    image_bytes: bytes, client: genai.Client, max_retries: int = 3
+) -> dict:
+  """呼叫 Gemini 辨識發票/收據照片（含 503 尖峰自動重試機制）"""
   image = Image.open(io.BytesIO(image_bytes))
   prompt = """
     你是一位專業的會計助理，請辨識此單據/發票/收據照片的資訊。
@@ -47,15 +50,26 @@ def parse_receipt(image_bytes: bytes, client: genai.Client) -> dict:
         "payment_method": "現金 或 刷卡"
     }
     """
-  response = client.models.generate_content(
-      model="gemini-2.5-flash",
-      contents=[image, prompt],
-      config=types.GenerateContentConfig(
-          response_mime_type="application/json",
-          temperature=0.1,
-      ),
-  )
-  return json.loads(response.text)
+
+  for attempt in range(max_retries):
+    try:
+      response = client.models.generate_content(
+          model="gemini-2.5-flash",
+          contents=[image, prompt],
+          config=types.GenerateContentConfig(
+              response_mime_type="application/json",
+              temperature=0.1,
+          ),
+      )
+      return json.loads(response.text)
+    except Exception as e:
+      # 遭遇 503 (尖峰繁忙) 或 429 (請求過快) 自動退避等待後重試
+      if (
+          "503" in str(e) or "429" in str(e) or "UNAVAILABLE" in str(e)
+      ) and attempt < max_retries - 1:
+        time.sleep(2 * (attempt + 1))
+        continue
+      raise e
 
 
 def write_to_excel(
@@ -148,6 +162,7 @@ if uploaded_files:
           try:
             res = parse_receipt(uploaded_file.getvalue(), client)
             parsed_results.append(res)
+            time.sleep(1)  # 避開 API 連續頻率限制
           except Exception as e:
             st.error(f"檔案 {uploaded_file.name} 辨識失敗: {e}")
         progress_bar.progress((i + 1) / len(uploaded_files))
@@ -162,7 +177,7 @@ if "parsed_results" in st.session_state:
       st.session_state["parsed_results"], num_rows="dynamic", use_container_width=True
   )
 
-  # 判斷範本存在性（相容 template.xlsx 或 template.xls）
+  # 自動偵測範本檔名
   template_target = (
       "template.xlsx" if os.path.exists("template.xlsx") else "template.xls"
   )
@@ -186,5 +201,6 @@ if "parsed_results" in st.session_state:
         )
     except Exception as err:
       st.error(
-          f"產出失敗: {err}（請確認範本是否為標準 .xlsx 格式，若為 .xls 請另存為 .xlsx 後上傳）"
+          f"產出失敗: {err}（請確認範本為 .xlsx 格式，若為舊版 .xls 請在 Excel 另存為"
+          " .xlsx 後上傳）"
       )
