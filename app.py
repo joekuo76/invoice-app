@@ -34,16 +34,14 @@ with st.sidebar:
     st.success("✅ API Key 已自動載入")
 
 
-def parse_receipt(image_bytes: bytes, client: genai.Client) -> dict:
-  """呼叫 Gemini 辨識發票/收據照片（具備雙模型備援與重試）"""
+def parse_receipt(
+    image_bytes: bytes, client: genai.Client, max_retries: int = 4
+) -> dict:
+  """呼叫 Gemini 辨識發票/收據照片（針對 503 尖峰自動退避等待）"""
   image = Image.open(io.BytesIO(image_bytes))
 
-  # 遇到 503 尖峰時，自動按順序切換備援模型
-  candidate_models = [
-      "gemini-2.5-flash",
-      "gemini-2.0-flash",
-      "gemini-1.5-flash",
-  ]
+  # 採用官方相容標準模型清單
+  models_to_try = ["gemini-2.5-flash", "gemini-2.0-flash"]
 
   prompt = """
     你是一位專業的會計助理，請辨識此單據/發票/收據照片的資訊。
@@ -58,8 +56,8 @@ def parse_receipt(image_bytes: bytes, client: genai.Client) -> dict:
     """
 
   last_error = None
-  for model_name in candidate_models:
-    for attempt in range(2):
+  for model_name in models_to_try:
+    for attempt in range(max_retries):
       try:
         response = client.models.generate_content(
             model=model_name,
@@ -72,10 +70,13 @@ def parse_receipt(image_bytes: bytes, client: genai.Client) -> dict:
         return json.loads(response.text)
       except Exception as e:
         last_error = e
-        time.sleep(1.5)  # 等待 1.5 秒後換模型或重試
-        continue
+        err_msg = str(e)
+        # 遇 503 (伺服器塞車) 或 429 (次數限制) 進行階梯式延遲重試
+        if "503" in err_msg or "429" in err_msg or "UNAVAILABLE" in err_msg:
+          time.sleep(3 * (attempt + 1))  # 依序等待 3s, 6s, 9s
+          continue
+        break  # 其他錯誤（如格式錯誤）換下一個模型
 
-  # 若三個模型節點都嘗試失敗才拋出
   raise last_error
 
 
@@ -169,7 +170,7 @@ if uploaded_files:
           try:
             res = parse_receipt(uploaded_file.getvalue(), client)
             parsed_results.append(res)
-            time.sleep(1)
+            time.sleep(1.5)  # 每次處理間隔 1.5 秒
           except Exception as e:
             st.error(f"檔案 {uploaded_file.name} 辨識失敗: {e}")
         progress_bar.progress((i + 1) / len(uploaded_files))
