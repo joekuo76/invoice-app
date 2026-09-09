@@ -361,6 +361,40 @@ OCR_PROMPT = """
 """
 
 
+def is_daily_quota_exhausted(error: Exception) -> bool:
+    """判斷是否為 Free Tier 每日/專案/模型額度已滿。"""
+    text = str(error).upper()
+    daily_markers = [
+        "GENERATEREQUESTSPERDAYPERPROJECTPERMODEL",
+        "FREE_TIER_REQUESTS",
+        "QUOTAVALUE",
+        "PERDAY",
+    ]
+    return "429" in text and any(marker in text for marker in daily_markers)
+
+
+def friendly_api_error(error: Exception) -> str:
+    text = str(error).upper()
+
+    if is_daily_quota_exhausted(error):
+        return (
+            "Gemini 免費 API 額度已達目前上限。"
+            "系統已停止繼續送出後面的新圖片，避免無效重試。"
+            "已成功辨識與快取的資料會保留；可稍後再試，或將 Gemini API 專案升級為付費層級。"
+        )
+
+    if "429" in text or "RESOURCE_EXHAUSTED" in text:
+        return "Gemini API 暫時達到頻率限制，請稍候再試。"
+
+    if "401" in text or "403" in text:
+        return "Gemini API Key 或專案權限有問題，請檢查 Streamlit Secrets 與 Google AI Studio 設定。"
+
+    if "404" in text:
+        return f"目前指定的模型 {MODEL_NAME} 無法使用，請檢查模型名稱。"
+
+    return f"辨識服務發生錯誤：{error}"
+
+
 def is_transient_error(error: Exception) -> bool:
     text = str(error).upper()
     markers = [
@@ -417,6 +451,11 @@ def parse_receipt(
 
         except Exception as exc:
             last_error = exc
+
+            # 每日 Free Tier 額度滿了，等待幾秒也不會解決，
+            # 因此不要繼續重試。
+            if is_daily_quota_exhausted(exc):
+                raise
 
             if not is_transient_error(exc):
                 raise
@@ -479,8 +518,8 @@ def write_to_excel_bytes(
     ws["F3"] = datetime.now().strftime("%Y-%m-%d")
 
     start_row = 5
-    end_row = 11
-    total_row = 12
+    end_row = 12
+    total_row = 13
     applicant_cell = "G15"
 
     max_items = end_row - start_row + 1
@@ -544,6 +583,24 @@ def write_to_excel_bytes(
 
     if applicant:
         ws[applicant_cell] = applicant
+
+    # =========================
+    # 列印設定
+    # =========================
+    # 固定列印整張請款單，避免 Excel 只印出局部範圍。
+    ws.print_area = "A1:G16"
+    ws.sheet_properties.pageSetUpPr.fitToPage = True
+    ws.page_setup.fitToWidth = 1
+    ws.page_setup.fitToHeight = 1
+    ws.page_setup.orientation = "landscape"
+    ws.page_setup.paperSize = ws.PAPERSIZE_A4
+    ws.page_margins.left = 0.25
+    ws.page_margins.right = 0.25
+    ws.page_margins.top = 0.35
+    ws.page_margins.bottom = 0.35
+    ws.page_margins.header = 0.1
+    ws.page_margins.footer = 0.1
+    ws.print_options.horizontalCentered = True
 
     output = io.BytesIO()
     wb.save(output)
@@ -617,6 +674,10 @@ if uploaded_files:
             status_text = st.empty()
 
             last_real_api_call_at = 0.0
+            quota_exhausted = False
+            success_count = 0
+            failed_count = 0
+            quota_skipped_count = 0
 
             for i, uploaded_file in enumerate(uploaded_files):
                 filename = uploaded_file.name
@@ -640,6 +701,27 @@ if uploaded_files:
                         st.session_state["cache_hits_this_run"] += 1
 
                     else:
+                        if quota_exhausted:
+                            quota_skipped_count += 1
+                            parsed_results.append(
+                                {
+                                    "document_type": "其他",
+                                    "date": "",
+                                    "invoice_no": "",
+                                    "parking_no": "",
+                                    "location": "",
+                                    "plate_no": "",
+                                    "summary": "",
+                                    "amount": 0,
+                                    "payment_method": "未知",
+                                    "source_file": filename,
+                                    "status": "額度不足－未送出",
+                                    "warning": "Gemini API 額度已滿，尚未辨識",
+                                }
+                            )
+                            progress_bar.progress((i + 1) / len(uploaded_files))
+                            continue
+
                         elapsed = time.time() - last_real_api_call_at
 
                         if elapsed < REQUEST_INTERVAL_SECONDS:
@@ -661,10 +743,21 @@ if uploaded_files:
                     result["warning"] = "、".join(warnings)
 
                     parsed_results.append(result)
+                    success_count += 1
 
                 except Exception as exc:
-                    st.error(f"❌ {filename} 辨識失敗")
-                    st.exception(exc)
+                    failed_count += 1
+
+                    if is_daily_quota_exhausted(exc):
+                        quota_exhausted = True
+                        st.warning(
+                            "⚠️ Gemini 免費 API 額度已達上限。"
+                            "系統將停止送出後續未快取圖片，避免重複產生 429 錯誤。"
+                        )
+                    else:
+                        st.error(f"❌ {filename} 辨識失敗")
+
+                    st.error(friendly_api_error(exc))
 
                     parsed_results.append(
                         {
@@ -691,19 +784,24 @@ if uploaded_files:
 
             st.success("🎉 辨識完成")
 
-            col1, col2, col3 = st.columns(3)
-            col1.metric(
-                "本次真正 API 呼叫",
+            col1, col2, col3, col4 = st.columns(4)
+            col1.metric("總圖片數", len(uploaded_files))
+            col2.metric("成功 / 快取", success_count)
+            col3.metric(
+                "真正 API 呼叫",
                 st.session_state["api_calls_this_run"],
             )
-            col2.metric(
+            col4.metric(
                 "快取命中",
                 st.session_state["cache_hits_this_run"],
             )
-            col3.metric(
-                "總圖片數",
-                len(uploaded_files),
-            )
+
+            if quota_exhausted:
+                st.info(
+                    "📊 本批次偵測到 Gemini API 額度不足。"
+                    f"未繼續送出的圖片：{quota_skipped_count} 張。"
+                    "這些圖片沒有浪費新的 API 請求，可待額度恢復後再辨識。"
+                )
 
 
 # =========================================================
@@ -875,7 +973,7 @@ template.xlsx
 - SHA-256 圖片快取
 - 相同圖片不重複消耗 API
 - 真正呼叫 API 時才限速
-- 429 / 503 等暫時性錯誤才重試
+- 429 每日額度滿時立即停止後續新請求\n- 暫時性 429 / 503 才使用退避重試
 - Structured Output 降低 JSON 格式錯誤
         """
     )
