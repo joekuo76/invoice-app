@@ -6,7 +6,7 @@ import random
 import re
 import sqlite3
 import time
-from pathlib import Path
+from datetime import datetime
 from typing import Literal
 
 import openpyxl
@@ -14,7 +14,6 @@ import pandas as pd
 import streamlit as st
 from google import genai
 from google.genai import types
-from openpyxl.styles import Alignment, Border, Side
 from PIL import Image, ImageOps
 from pydantic import BaseModel, Field, ValidationError
 
@@ -30,26 +29,16 @@ st.set_page_config(
 )
 
 st.title("🧾 請款單自動生成工具")
-st.caption("上傳發票 / 收據照片 → AI 辨識 → 人工確認 → 產出 Excel")
+st.caption("上傳發票 / 收據 / 停車繳費單 → AI 辨識 → 人工確認 → 產出 Excel")
 
 
 # =========================================================
 # 可調整參數
 # =========================================================
 
-# 優先使用目前的 Flash 模型。
-# 若日後 Google 更換模型，可只改這裡，不必修改其他程式。
 MODEL_NAME = os.environ.get("GEMINI_MODEL", "gemini-3.8-flash")
-
-# 每次真正送 API 之間至少間隔幾秒。
-# 公司內部使用建議 2~4 秒，不要瞬間大量併發。
 REQUEST_INTERVAL_SECONDS = 3.0
-
-# 自訂重試次數。SDK 本身已有暫時性錯誤重試，
-# 這裡只再做應用層的保護，因此不要設太高。
 MAX_RETRIES = 2
-
-# 圖片最長邊。發票文字小，不建議壓到 1200px。
 MAX_IMAGE_SIDE = 2400
 
 CACHE_DB = "receipt_cache.sqlite3"
@@ -61,7 +50,6 @@ TEMPLATE_PATH = "template.xlsx"
 # =========================================================
 
 def get_api_key() -> str:
-    """依序讀取 Streamlit Secrets、環境變數。"""
     try:
         if "GEMINI_API_KEY" in st.secrets:
             return str(st.secrets["GEMINI_API_KEY"]).strip()
@@ -116,27 +104,45 @@ with st.sidebar:
 # =========================================================
 
 class ReceiptData(BaseModel):
+    document_type: Literal["發票", "收據", "停車繳費單", "其他"] = "其他"
+
     date: str = Field(
         default="",
-        description="消費或開立日期，格式 YYYY-MM-DD；無法辨識則空字串。",
+        description="消費、交易、停車或開立日期，格式 YYYY-MM-DD；無法辨識則空字串。",
     )
+
     invoice_no: str = Field(
         default="",
-        description="台灣發票號碼，格式兩碼大寫英文字母加八碼數字；沒有則空字串。",
+        description="台灣統一發票號碼，兩碼大寫英文字母加八碼數字；沒有則空字串。",
     )
+
+    parking_no: str = Field(
+        default="",
+        description="停車繳費單號、停車單號、交易編號或繳費編號；沒有則空字串。",
+    )
+
+    location: str = Field(
+        default="",
+        description="停車場名稱、路段、店家名稱或可辨識的地點資訊。",
+    )
+
+    plate_no: str = Field(
+        default="",
+        description="車牌號碼；沒有則空字串。",
+    )
+
     summary: str = Field(
         default="",
-        description="簡短中文付款內容摘要，建議 2~12 個中文字。",
+        description="簡短中文付款內容摘要，例如加油、停車費、餐費、五金耗材。",
     )
+
     amount: int = Field(
         default=0,
         ge=0,
-        description="實際支付總額，僅整數，不含逗號與貨幣符號。",
+        description="實際支付或應繳總額，僅整數，不含逗號與貨幣符號。",
     )
-    payment_method: Literal["現金", "刷卡", "未知"] = Field(
-        default="未知",
-        description="付款方式。",
-    )
+
+    payment_method: Literal["現金", "刷卡", "未知"] = "未知"
 
 
 # =========================================================
@@ -144,7 +150,6 @@ class ReceiptData(BaseModel):
 # =========================================================
 
 def init_cache_db() -> None:
-    """建立 SQLite 快取資料表。"""
     conn = sqlite3.connect(CACHE_DB)
     try:
         conn.execute(
@@ -219,11 +224,6 @@ def write_cache(image_hash: str, result: dict) -> None:
 # =========================================================
 
 def prepare_image(image_bytes: bytes) -> Image.Image:
-    """
-    1. 自動依 EXIF 修正旋轉
-    2. 轉 RGB
-    3. 保留較高解析度以提高發票小字辨識率
-    """
     img = Image.open(io.BytesIO(image_bytes))
     img = ImageOps.exif_transpose(img)
 
@@ -240,7 +240,6 @@ def prepare_image(image_bytes: bytes) -> Image.Image:
 
 
 def basic_image_check(image_bytes: bytes) -> tuple[bool, str]:
-    """很輕量的圖片檢查，避免明顯無效圖片浪費 API。"""
     try:
         img = Image.open(io.BytesIO(image_bytes))
         width, height = img.size
@@ -265,19 +264,29 @@ def normalize_invoice_no(value: str) -> str:
     return match.group(0) if match else ""
 
 
+def normalize_plate_no(value: str) -> str:
+    value = (value or "").upper().strip()
+    value = re.sub(r"\s+", "", value)
+    return value
+
+
 def normalize_result(data: dict) -> dict:
-    """把模型回傳內容再做一次程式端防呆。"""
     result = ReceiptData.model_validate(data).model_dump()
 
     result["invoice_no"] = normalize_invoice_no(result.get("invoice_no", ""))
+    result["plate_no"] = normalize_plate_no(result.get("plate_no", ""))
 
-    summary = str(result.get("summary", "")).strip()
-    result["summary"] = summary[:30]
+    result["summary"] = str(result.get("summary", "")).strip()[:30]
+    result["location"] = str(result.get("location", "")).strip()[:50]
+    result["parking_no"] = str(result.get("parking_no", "")).strip()[:50]
 
     try:
         result["amount"] = int(result.get("amount", 0))
     except (TypeError, ValueError):
         result["amount"] = 0
+
+    if result["document_type"] == "停車繳費單" and not result["summary"]:
+        result["summary"] = "停車費"
 
     return result
 
@@ -295,6 +304,10 @@ def receipt_has_warning(data: dict) -> list[str]:
     if invoice_no and not re.fullmatch(r"[A-Z]{2}\d{8}", invoice_no):
         warnings.append("發票號碼格式異常")
 
+    if data.get("document_type") == "停車繳費單":
+        if not data.get("parking_no") and not data.get("plate_no"):
+            warnings.append("停車單號/車牌未辨識")
+
     if not data.get("summary"):
         warnings.append("摘要未辨識")
 
@@ -306,47 +319,45 @@ def receipt_has_warning(data: dict) -> list[str]:
 # =========================================================
 
 OCR_PROMPT = """
-你是專門處理台灣公司請款資料的發票與收據辨識系統。
+你是專門處理台灣公司請款資料的發票、收據與停車繳費單辨識系統。
 
-請仔細閱讀圖片中所有可見文字，抽取一張單據的主要請款資訊。
-若圖片是台灣電子發票證明聯、傳統發票、加油發票、停車收據、
-餐飲收據、五金行收據、刷卡簽單或一般收據，都使用相同欄位回傳。
+請先判斷單據類型：
+- 發票
+- 收據
+- 停車繳費單
+- 其他
 
-請遵守以下規則：
+然後抽取主要請款資訊。
 
-【date】
-- 優先使用「消費日期」、「交易日期」或「發票開立日期」。
-- 統一輸出 YYYY-MM-DD。
-- 民國年轉為西元年，例如 115/08/20 = 2026-08-20。
-- 不確定時輸出空字串，不要猜測。
+【發票 / 收據】
+- date：優先使用消費日期、交易日期或開立日期
+- invoice_no：只填台灣統一發票號碼，格式為 2 個英文字母 + 8 個數字
+- summary：例如加油、餐費、五金耗材、文具、交通費
+- amount：找總計、合計、應付、實付、TOTAL
+- payment_method：看到 VISA、Mastercard、JCB、信用卡、刷卡、卡號末四碼等資訊時輸出「刷卡」；
+  明確看到現金則輸出「現金」，無法判斷輸出「未知」
 
-【invoice_no】
-- 台灣統一發票號碼通常為 2 個英文字母 + 8 個數字，例如 AB12345678。
-- 英文字母輸出大寫。
-- 不要把「統一編號 / 統編」8 位數字當成發票號碼。
-- 一般收據沒有發票號碼時輸出空字串。
+【停車繳費單】
+- document_type 必須輸出「停車繳費單」
+- summary 優先輸出「停車費」
+- date：優先辨識停車日期、繳費日期、交易日期
+- parking_no：辨識繳費單號、停車單號、交易編號或繳費編號
+- location：辨識停車場名稱、停車場站點、路段或其他地點
+- plate_no：辨識車牌號碼
+- invoice_no：只有真的存在正式統一發票號碼才填，否則留空
+- amount：辨識應繳或實繳停車費
+- payment_method：若無法判斷則輸出「未知」
 
-【summary】
-- 根據店家名稱與品項產生簡短中文摘要。
-- 例如：加油、停車費、餐費、工地飲料、五金耗材、文具、交通費。
-- 不要照抄整張收據，也不要加入發票號碼。
-- 如果無法判斷，可以使用店家名稱或「其他費用」。
-
-【amount】
-- 找出實際應付 / 實付總額。
-- 優先辨識：總計、合計、應付、實付、TOTAL、總額。
-- 不要把小計、稅額、折扣、找零、信用卡授權碼當成金額。
-- 新台幣只輸出整數。
-- 無法確認則輸出 0。
-
-【payment_method】
-- 若看到 VISA、Mastercard、JCB、信用卡、刷卡、卡號、末四碼等刷卡資訊，輸出「刷卡」。
-- 明確看到現金付款則輸出「現金」。
-- 無法判斷則輸出「未知」。
+【日期格式】
+- 統一輸出 YYYY-MM-DD
+- 民國年轉為西元年，例如 115/08/20 = 2026-08-20
+- 不確定時留空，不要猜測
 
 重要：
-- 不要猜測模糊或被遮住的文字。
-- 只回傳指定 schema 內容。
+- 不要把統一編號 8 位數字誤認成發票號碼
+- 不要把稅額、小計、折扣、找零、授權碼當成總額
+- 不要猜測模糊或被遮住的文字
+- 只回傳指定 schema
 """
 
 
@@ -370,9 +381,6 @@ def parse_receipt(
     image_bytes: bytes,
     client: genai.Client,
 ) -> tuple[dict, bool]:
-    """
-    回傳 (辨識結果, 是否來自快取)
-    """
 
     image_hash = get_image_hash(image_bytes)
 
@@ -381,7 +389,6 @@ def parse_receipt(
         return normalize_result(cached), True
 
     image = prepare_image(image_bytes)
-
     last_error = None
 
     for attempt in range(MAX_RETRIES + 1):
@@ -399,7 +406,6 @@ def parse_receipt(
             if not response.text:
                 raise RuntimeError("Gemini 沒有回傳可解析內容。")
 
-            # response_schema 已限制格式，仍做 Pydantic 驗證。
             parsed = ReceiptData.model_validate_json(response.text)
             result = normalize_result(parsed.model_dump())
 
@@ -407,18 +413,15 @@ def parse_receipt(
             return result, False
 
         except (ValidationError, json.JSONDecodeError) as exc:
-            # 格式錯誤通常重試一次有機會恢復
             last_error = exc
 
         except Exception as exc:
             last_error = exc
 
-            # 400 / 401 / 403 / 404 等通常不應重試
             if not is_transient_error(exc):
                 raise
 
         if attempt < MAX_RETRIES:
-            # 指數退避 + jitter
             delay = (2 ** attempt) * 2 + random.uniform(0.2, 1.0)
             time.sleep(delay)
 
@@ -428,6 +431,31 @@ def parse_receipt(
 # =========================================================
 # Excel
 # =========================================================
+
+def build_excel_summary(item: dict) -> str:
+    summary = item.get("summary", "") or ""
+
+    if item.get("document_type") == "停車繳費單":
+        location = item.get("location", "")
+        if location:
+            return f"停車費－{location}"[:40]
+        return "停車費"
+
+    return summary
+
+
+def build_excel_reference(item: dict) -> str:
+    invoice_no = item.get("invoice_no", "")
+    if invoice_no:
+        return invoice_no
+
+    if item.get("document_type") == "停車繳費單":
+        parking_no = item.get("parking_no", "")
+        if parking_no:
+            return parking_no
+
+    return ""
+
 
 def write_to_excel_bytes(
     items: list[dict],
@@ -448,71 +476,74 @@ def write_to_excel_bytes(
     if dept:
         ws["B3"] = dept
 
+    ws["F3"] = datetime.now().strftime("%Y-%m-%d")
+
     start_row = 5
+    end_row = 11
+    total_row = 12
+    applicant_cell = "G15"
 
-    thin_border = Border(
-        left=Side(style="thin"),
-        right=Side(style="thin"),
-        top=Side(style="thin"),
-        bottom=Side(style="thin"),
-    )
+    max_items = end_row - start_row + 1
 
-    center_align = Alignment(
-        horizontal="center",
-        vertical="center",
-        wrap_text=True,
-    )
+    if len(items) > max_items:
+        raise ValueError(
+            f"目前範本最多只能放 {max_items} 筆資料，"
+            f"目前共有 {len(items)} 筆。"
+        )
 
-    right_align = Alignment(
-        horizontal="right",
-        vertical="center",
-    )
+    for row in range(start_row, end_row + 1):
+        for col in range(1, 8):
+            ws.cell(row=row, column=col).value = None
 
     for idx, raw_item in enumerate(items):
         item = normalize_result(raw_item)
         row = start_row + idx
 
-        ws.cell(row=row, column=1, value=item.get("date", "")).alignment = center_align
-        ws.cell(row=row, column=2, value=item.get("invoice_no", "")).alignment = center_align
-        ws.cell(row=row, column=3, value=item.get("summary", "")).alignment = center_align
-        ws.cell(row=row, column=4, value=item.get("amount", 0)).alignment = right_align
-        ws.cell(row=row, column=5, value=item.get("payment_method", "未知")).alignment = center_align
+        ws.cell(row=row, column=1, value=item.get("date", ""))
+        ws.cell(row=row, column=2, value=build_excel_reference(item))
+        ws.cell(row=row, column=3, value=build_excel_summary(item))
 
-        for col in range(1, 8):
-            ws.cell(row=row, column=col).border = thin_border
-
-    total_row = start_row + len(items)
-
-    ws.cell(row=total_row, column=1, value="合    計").alignment = center_align
-
-    if items:
-        ws.cell(
-            row=total_row,
+        amount_cell = ws.cell(
+            row=row,
             column=4,
-            value=f"=SUM(D{start_row}:D{total_row - 1})",
-        ).alignment = right_align
-    else:
-        ws.cell(row=total_row, column=4, value=0).alignment = right_align
+            value=item.get("amount", 0),
+        )
+        amount_cell.number_format = '$#,##0'
 
-    for col in range(1, 8):
-        ws.cell(row=total_row, column=col).border = thin_border
-
-    sign_row = total_row + 2
-
-    roles = ["總經理", "", "出納", "", "會計", "主管", "請款人"]
-    for col_idx, role in enumerate(roles, start=1):
         ws.cell(
-            row=sign_row,
-            column=col_idx,
-            value=role,
-        ).alignment = center_align
+            row=row,
+            column=5,
+            value=item.get("payment_method", "未知"),
+        )
+
+        if item.get("document_type") == "停車繳費單":
+            ws.cell(row=row, column=6, value="停車繳費單")
+        else:
+            ws.cell(row=row, column=6, value=item.get("document_type", ""))
+
+        note_parts = []
+
+        if item.get("plate_no"):
+            note_parts.append(f"車牌:{item['plate_no']}")
+
+        if item.get("document_type") == "停車繳費單" and item.get("location"):
+            note_parts.append(item["location"])
+
+        ws.cell(
+            row=row,
+            column=7,
+            value=" / ".join(note_parts),
+        )
+
+    total_cell = ws.cell(
+        row=total_row,
+        column=4,
+        value=f"=SUM(D{start_row}:D{end_row})",
+    )
+    total_cell.number_format = '$#,##0'
 
     if applicant:
-        ws.cell(
-            row=sign_row + 1,
-            column=7,
-            value=applicant,
-        ).alignment = center_align
+        ws[applicant_cell] = applicant
 
     output = io.BytesIO()
     wb.save(output)
@@ -540,7 +571,7 @@ if "cache_hits_this_run" not in st.session_state:
 # =========================================================
 
 uploaded_files = st.file_uploader(
-    "上傳發票或收據照片（可多選）",
+    "上傳發票、收據或停車繳費單照片（可多選）",
     type=["jpg", "jpeg", "png", "webp"],
     accept_multiple_files=True,
 )
@@ -570,7 +601,6 @@ if uploaded_files:
 if uploaded_files:
     if not api_key:
         st.warning("⚠️ 請先設定 Gemini API Key。")
-
     else:
         if st.button(
             "🚀 開始辨識單據",
@@ -610,7 +640,6 @@ if uploaded_files:
                         st.session_state["cache_hits_this_run"] += 1
 
                     else:
-                        # 只有真的要呼叫 API 時才限速。
                         elapsed = time.time() - last_real_api_call_at
 
                         if elapsed < REQUEST_INTERVAL_SECONDS:
@@ -639,8 +668,12 @@ if uploaded_files:
 
                     parsed_results.append(
                         {
+                            "document_type": "其他",
                             "date": "",
                             "invoice_no": "",
+                            "parking_no": "",
+                            "location": "",
+                            "plate_no": "",
                             "summary": "",
                             "amount": 0,
                             "payment_method": "未知",
@@ -684,8 +717,12 @@ if st.session_state["parsed_results"]:
     df = pd.DataFrame(st.session_state["parsed_results"])
 
     preferred_columns = [
+        "document_type",
         "date",
         "invoice_no",
+        "parking_no",
+        "location",
+        "plate_no",
         "summary",
         "amount",
         "payment_method",
@@ -706,8 +743,15 @@ if st.session_state["parsed_results"]:
         use_container_width=True,
         hide_index=True,
         column_config={
+            "document_type": st.column_config.SelectboxColumn(
+                "單據類型",
+                options=["發票", "收據", "停車繳費單", "其他"],
+            ),
             "date": st.column_config.TextColumn("日期"),
             "invoice_no": st.column_config.TextColumn("發票號碼"),
+            "parking_no": st.column_config.TextColumn("停車單號"),
+            "location": st.column_config.TextColumn("停車場 / 地點"),
+            "plate_no": st.column_config.TextColumn("車牌"),
             "summary": st.column_config.TextColumn("摘要"),
             "amount": st.column_config.NumberColumn(
                 "金額",
@@ -735,13 +779,18 @@ if st.session_state["parsed_results"]:
         key="receipt_editor",
     )
 
-    st.caption("⚠️ AI 辨識結果請務必人工確認，尤其是金額、日期與發票號碼。")
+    st.caption(
+        "⚠️ AI 辨識結果請務必人工確認，尤其是金額、日期、發票號碼、停車單號與車牌。"
+    )
 
-    # Excel 只取會計欄位
     excel_records = edited_df[
         [
+            "document_type",
             "date",
             "invoice_no",
+            "parking_no",
+            "location",
+            "plate_no",
             "summary",
             "amount",
             "payment_method",
@@ -779,23 +828,41 @@ if st.session_state["parsed_results"]:
 with st.expander("ℹ️ 使用與部署說明"):
     st.markdown(
         """
-### Streamlit Secrets
+### 支援單據
 
-在 Streamlit Cloud 的 Secrets 中加入：
+- 台灣統一發票
+- 一般收據
+- 加油發票
+- 停車場繳費單
+- 路邊停車繳費單
+- 停車收據
+
+### 停車繳費單辨識欄位
+
+系統會盡量辨識：
+
+- 停車日期 / 繳費日期
+- 停車單號 / 繳費編號
+- 停車場名稱 / 路段
+- 車牌號碼
+- 停車金額
+- 付款方式
+
+若停車單沒有正式發票號碼，Excel 的「發票編號」欄會改放停車單號，方便報帳追蹤。
+
+### Streamlit Secrets
 
 ```toml
 GEMINI_API_KEY = "你的 API Key"
 ```
 
-如果要指定其他模型，也可以加入：
+如需更換模型：
 
 ```toml
 GEMINI_MODEL = "gemini-3.8-flash"
 ```
 
-### 檔案
-
-請確定專案至少有：
+### 專案檔案
 
 ```text
 app.py
@@ -805,13 +872,10 @@ template.xlsx
 
 ### API 節省機制
 
-這個版本會：
-
-- 使用 SHA-256 判斷同一張圖片
-- 相同圖片直接使用 SQLite 快取
-- 只有真正呼叫 API 時才做限速
+- SHA-256 圖片快取
+- 相同圖片不重複消耗 API
+- 真正呼叫 API 時才限速
 - 429 / 503 等暫時性錯誤才重試
-- 使用 Structured Output 降低 JSON 格式錯誤
-- 每張正常單據原則上只需要一次 API 呼叫
+- Structured Output 降低 JSON 格式錯誤
         """
     )
