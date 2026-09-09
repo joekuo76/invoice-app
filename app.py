@@ -11,39 +11,34 @@ from PIL import Image, ImageOps
 import zxingcpp
 
 st.set_page_config(page_title="請款單自動生成系統", page_icon="🧾", layout="wide")
-st.title("🧾 請款單自動生成工具 V6")
-st.caption("電子發票 QR｜代收繳費單／停車單條碼｜人工補登｜一鍵產生 Excel")
-st.success("V6 輕量版：不使用 Gemini、不使用 EasyOCR、不使用 Torch。")
+st.title("🧾 請款單自動生成工具 V6.1")
+st.caption("保留 V5 操作方式｜可批量上傳｜新增 QR / 一維條碼辨識")
+st.success("輕量穩定版：不使用 Gemini、不使用 EasyOCR、不使用 Torch。")
 
 TEMPLATE_PATH = "template.xlsx"
 MAX_ITEMS = 8
 
-if "items_v6" not in st.session_state:
-    st.session_state.items_v6 = []
+if "items_v61" not in st.session_state:
+    st.session_state.items_v61 = []
 
 
 # ---------- 共用 ----------
-def load_image(data: bytes) -> Image.Image:
+def load_image(data: bytes):
     img = Image.open(io.BytesIO(data))
     return ImageOps.exif_transpose(img).convert("RGB")
 
 
-def decode_barcodes(img: Image.Image):
-    """讀取 QR / Code128 / Code39 / EAN / ITF 等 zxing-cpp 支援格式。"""
+def decode_barcodes(img):
     results = []
     try:
         decoded = zxingcpp.read_barcodes(np.array(img))
         for r in decoded:
-            text = getattr(r, "text", "") or ""
-            text = text.strip()
-            if not text:
-                continue
-
-            fmt = str(getattr(r, "format", "Unknown"))
-            results.append({
-                "text": text,
-                "format": fmt,
-            })
+            text = (getattr(r, "text", "") or "").strip()
+            if text:
+                results.append({
+                    "text": text,
+                    "format": str(getattr(r, "format", "Unknown")),
+                })
     except Exception:
         pass
     return results
@@ -54,20 +49,16 @@ def roc_date_to_iso(v: str):
     if len(digits) != 7:
         return ""
     try:
-        y = int(digits[:3]) + 1911
-        m = int(digits[3:5])
-        d = int(digits[5:7])
-        return datetime(y, m, d).strftime("%Y-%m-%d")
+        return datetime(
+            int(digits[:3]) + 1911,
+            int(digits[3:5]),
+            int(digits[5:7]),
+        ).strftime("%Y-%m-%d")
     except Exception:
         return ""
 
 
-def parse_invoice_qr(text: str):
-    """
-    台灣電子發票左側 QR 常見前段：
-    10碼發票號碼 + 7碼民國日期 + 4碼隨機碼
-    + 8碼銷售額(hex) + 8碼總額(hex)
-    """
+def parse_invoice_qr(text):
     s = (text or "").replace("\n", "").strip()
     if len(s) < 37:
         return None
@@ -99,43 +90,34 @@ def parse_invoice_qr(text: str):
         "payment_method": "未知",
         "location": "",
         "plate_no": "",
-        "barcode_raw": s,
         "source": "QR自動",
+        "barcode_raw": s,
     }
 
 
-def guess_date_from_text(text: str):
-    """只從條碼內容本身猜日期，不讀取紙本印刷文字。"""
+def guess_date_from_barcode(text: str):
     t = re.sub(r"\s+", "", text or "")
 
-    # YYYYMMDD
     for m in re.finditer(r"(?<!\d)(20\d{2})(0[1-9]|1[0-2])([0-2]\d|3[01])(?!\d)", t):
         try:
             return datetime(int(m.group(1)), int(m.group(2)), int(m.group(3))).strftime("%Y-%m-%d")
         except Exception:
             pass
 
-    # ROC YYYMMDD
     for m in re.finditer(r"(?<!\d)(1\d{2})(0[1-9]|1[0-2])([0-2]\d|3[01])(?!\d)", t):
-        date = roc_date_to_iso("".join(m.groups()))
-        if date:
-            return date
+        d = roc_date_to_iso("".join(m.groups()))
+        if d:
+            return d
 
     return ""
 
 
-def guess_amount_from_text(text: str):
-    """
-    保守模式：只有條碼文字明確含 amount/amt/金額 關鍵字時才抓，
-    避免把帳號、停車編號誤判成金額。
-    """
-    t = text or ""
-    patterns = [
+def guess_amount_from_barcode(text: str):
+    for p in [
         r"(?i)(?:amount|amt)\s*[:=]\s*([0-9]{1,7})",
         r"金額\s*[:：=]?\s*([0-9]{1,7})",
-    ]
-    for p in patterns:
-        m = re.search(p, t)
+    ]:
+        m = re.search(p, text or "")
         if m:
             try:
                 return int(m.group(1))
@@ -144,84 +126,74 @@ def guess_amount_from_text(text: str):
     return 0
 
 
-def clean_reference(text: str):
-    """把條碼原文整理成適合放 Excel 單號欄的內容。"""
-    t = (text or "").strip()
-    if len(t) <= 40:
-        return t
-    # 過長內容只取前 40 碼做顯示，完整內容仍保留 barcode_raw
-    return t[:40]
-
-
-def parse_general_barcode(decoded):
-    """
-    一般代收／停車單：
-    不假裝知道各家私有格式，只把實際讀到的條碼帶入，
-    日期／金額僅做保守猜測，最後讓使用者確認。
-    """
+def parse_general_barcode(decoded, preferred_type):
     if not decoded:
         return None
 
-    # 優先選最長的非 QR 條碼；若只有 QR 就用最長的
+    # 優先使用非 QR 的一維條碼；否則使用最長內容
     ordered = sorted(
         decoded,
         key=lambda x: (("QRCode" not in x["format"]), len(x["text"])),
-        reverse=True
+        reverse=True,
     )
     primary = ordered[0]
-    all_raw = " | ".join([f'{x["format"]}:{x["text"]}' for x in decoded])
+    pool = " ".join(x["text"] for x in decoded)
 
-    text_pool = " ".join(x["text"] for x in decoded)
+    doc_type = preferred_type
+    if doc_type == "自動判斷":
+        doc_type = "代收繳費單"
+
+    summary = ""
+    if doc_type == "停車繳費單":
+        summary = "停車費"
+    elif doc_type == "代收繳費單":
+        summary = "代收繳費"
+
+    ref = primary["text"].strip()
+    if len(ref) > 40:
+        ref = ref[:40]
+
     return {
-        "document_type": "代收繳費單",
-        "date": guess_date_from_text(text_pool),
-        "reference_no": clean_reference(primary["text"]),
-        "summary": "代收繳費",
-        "amount": guess_amount_from_text(text_pool),
+        "document_type": doc_type,
+        "date": guess_date_from_barcode(pool),
+        "reference_no": ref,
+        "summary": summary,
+        "amount": guess_amount_from_barcode(pool),
         "payment_method": "未知",
         "location": "",
         "plate_no": "",
-        "barcode_raw": all_raw,
         "source": "條碼自動",
+        "barcode_raw": " | ".join(f'{x["format"]}:{x["text"]}' for x in decoded),
     }
 
 
-def scan_document(data: bytes, preferred_type="自動判斷"):
+def scan_document(data, preferred_type="自動判斷"):
     img = load_image(data)
     decoded = decode_barcodes(img)
 
-    # 電子發票優先
     for d in decoded:
         inv = parse_invoice_qr(d["text"])
         if inv:
             return inv, decoded
 
     if decoded:
-        item = parse_general_barcode(decoded)
-        if preferred_type == "停車繳費單":
-            item["document_type"] = "停車繳費單"
-            item["summary"] = "停車費"
-        elif preferred_type == "收據":
-            item["document_type"] = "收據"
-            item["summary"] = ""
-        elif preferred_type == "其他":
-            item["document_type"] = "其他"
-            item["summary"] = ""
-        return item, decoded
+        return parse_general_barcode(decoded, preferred_type), decoded
 
     return None, []
 
 
 def normalize_item(x):
     x = dict(x)
-    x["document_type"] = str(x.get("document_type", "其他") or "其他")
-    x["date"] = str(x.get("date", "") or "").strip()
-    x["reference_no"] = str(x.get("reference_no", "") or "").upper().strip()
-    x["summary"] = str(x.get("summary", "") or "").strip()
-    x["payment_method"] = str(x.get("payment_method", "未知") or "未知")
-    x["location"] = str(x.get("location", "") or "").strip()
-    x["plate_no"] = str(x.get("plate_no", "") or "").upper().strip()
-    x["barcode_raw"] = str(x.get("barcode_raw", "") or "").strip()
+    for k in [
+        "document_type", "date", "reference_no", "summary",
+        "payment_method", "location", "plate_no", "source", "barcode_raw"
+    ]:
+        x[k] = str(x.get(k, "") or "").strip()
+
+    if not x["document_type"]:
+        x["document_type"] = "其他"
+    if not x["payment_method"]:
+        x["payment_method"] = "未知"
 
     try:
         x["amount"] = int(float(x.get("amount", 0) or 0))
@@ -231,7 +203,7 @@ def normalize_item(x):
     return x
 
 
-def write_excel(items, dept, applicant_name):
+def write_excel(items, department, applicant):
     if not os.path.exists(TEMPLATE_PATH):
         raise FileNotFoundError("找不到 template.xlsx")
 
@@ -243,7 +215,7 @@ def write_excel(items, dept, applicant_name):
     if len(items) > MAX_ITEMS:
         raise ValueError(f"目前範本最多 {MAX_ITEMS} 筆")
 
-    ws["B3"] = dept or ""
+    ws["B3"] = department or ""
     ws["F3"] = datetime.now().strftime("%Y-%m-%d")
 
     for r in range(start_row, end_row + 1):
@@ -279,8 +251,8 @@ def write_excel(items, dept, applicant_name):
 
     ws.cell(total_row, 4, f"=SUM(D{start_row}:D{end_row})").number_format = '$#,##0'
 
-    if applicant_name:
-        ws["G16"] = applicant_name
+    if applicant:
+        ws["G16"] = applicant
 
     ws.print_area = "A1:G16"
     ws.sheet_properties.pageSetUpPr.fitToPage = True
@@ -304,77 +276,94 @@ with st.sidebar:
     st.header("⚙️ 請款資料")
     applicant = st.text_input("請款人姓名")
     department = st.text_input("請款單位")
-    st.caption("Excel 範本最多 8 筆明細。")
+    st.caption("目前 Excel 範本最多 8 筆明細。")
 
 
-# ---------- 主功能 ----------
+# ---------- V5 風格介面 ----------
 tab1, tab2, tab3 = st.tabs([
-    "📷 自動掃描",
+    "📷 批量上傳辨識",
     "✍️ 人工新增",
     "📋 請款明細",
 ])
 
 with tab1:
-    st.subheader("拍照 / 上傳單據")
+    st.subheader("批量上傳單據")
+    st.write("不會自動開啟相機。手機可從檔案選擇器自行決定拍照或選相簿。")
 
-    source_type = st.radio(
-        "單據類型",
+    preferred_type = st.radio(
+        "這批照片主要是哪一類？",
         ["自動判斷", "停車繳費單", "代收繳費單", "收據", "其他"],
         horizontal=True,
     )
 
-    c1, c2 = st.columns(2)
+    files = st.file_uploader(
+        "選擇照片（可一次多選）",
+        type=["jpg", "jpeg", "png", "webp"],
+        accept_multiple_files=True,
+        key="batch_upload_v61",
+    )
 
-    with c1:
-        camera_file = st.camera_input("📸 手機直接拍照")
+    if files:
+        st.caption(f"已選擇 {len(files)} 張照片")
 
-    with c2:
-        upload_file = st.file_uploader(
-            "🖼️ 或從相簿 / 電腦上傳",
-            type=["jpg", "jpeg", "png", "webp"],
-            key="v6_upload",
-        )
+        cols = st.columns(min(4, len(files)))
+        for i, f in enumerate(files):
+            with cols[i % len(cols)]:
+                st.image(f, caption=f.name, width="stretch")
 
-    current_file = camera_file if camera_file is not None else upload_file
+        if st.button("🔎 批量掃描 QR / 條碼", type="primary", width="stretch"):
+            success = 0
+            failed = 0
 
-    if current_file is not None:
-        st.image(current_file, caption="目前單據", width="stretch")
+            for f in files:
+                try:
+                    item, decoded = scan_document(f.getvalue(), preferred_type)
 
-        if st.button("🔎 掃描 QR / 條碼", type="primary", width="stretch"):
-            try:
-                item, decoded = scan_document(current_file.getvalue(), source_type)
+                    if item:
+                        item["filename"] = f.name
+                        st.session_state.items_v61.append(item)
+                        success += 1
+                    else:
+                        st.session_state.items_v61.append({
+                            "document_type": preferred_type if preferred_type != "自動判斷" else "其他",
+                            "date": "",
+                            "reference_no": "",
+                            "summary": "",
+                            "amount": 0,
+                            "payment_method": "未知",
+                            "location": "",
+                            "plate_no": "",
+                            "source": "未辨識",
+                            "barcode_raw": "",
+                            "filename": f.name,
+                        })
+                        failed += 1
+                except Exception:
+                    failed += 1
 
-                if not decoded:
-                    st.warning(
-                        "這張照片沒有讀到 QR Code 或一維條碼。"
-                        "V6 不使用大型 OCR，因此請改到「人工新增」輸入紙本上的文字。"
-                    )
-                elif item:
-                    st.session_state.items_v6.append(item)
-                    st.success(f"已讀到 {len(decoded)} 個 QR/條碼，並加入一筆資料。")
-                    with st.expander("查看讀到的條碼內容"):
-                        for i, d in enumerate(decoded, 1):
-                            st.code(f"{i}. {d['format']}\n{d['text']}")
-                    st.rerun()
-            except Exception as exc:
-                st.error(f"掃描失敗：{exc}")
+            if success:
+                st.success(f"成功辨識 {success} 張。")
+            if failed:
+                st.warning(f"{failed} 張沒有讀到可用 QR / 條碼，已建立空白資料供你手動補填。")
+
+            st.rerun()
 
     st.info(
-        "V6 會掃描 QR Code 與一維條碼。"
-        "若條碼沒有直接包含日期或金額，系統不會亂猜，請在明細表手動補上。"
+        "V6.1 不做大型 OCR。電子發票會讀 QR；代收／停車單會讀條碼。"
+        "沒有讀到的照片仍會建立一筆空白明細，方便你直接補資料。"
     )
 
 
 with tab2:
     st.subheader("人工新增")
 
-    with st.form("manual_v6", clear_on_submit=True):
+    with st.form("manual_form_v61", clear_on_submit=True):
         doc_type = st.selectbox(
             "單據類型",
             ["停車繳費單", "代收繳費單", "收據", "發票", "其他"],
         )
         date = st.text_input("日期", placeholder="2026-09-09")
-        reference_no = st.text_input("發票 / 單據 / 繳費編號")
+        reference_no = st.text_input("發票 / 單據 / 停車編號")
         summary = st.text_input("付款內容摘要")
         amount = st.number_input("金額", min_value=0, step=1)
         payment_method = st.selectbox("付款方式", ["未知", "現金", "刷卡"])
@@ -386,10 +375,10 @@ with tab2:
         if submitted:
             if doc_type == "停車繳費單" and not summary:
                 summary = "停車費"
-            if doc_type == "代收繳費單" and not summary:
+            elif doc_type == "代收繳費單" and not summary:
                 summary = "代收繳費"
 
-            st.session_state.items_v6.append({
+            st.session_state.items_v61.append({
                 "document_type": doc_type,
                 "date": date,
                 "reference_no": reference_no,
@@ -398,8 +387,9 @@ with tab2:
                 "payment_method": payment_method,
                 "location": location,
                 "plate_no": plate_no,
-                "barcode_raw": "",
                 "source": "人工輸入",
+                "barcode_raw": "",
+                "filename": "",
             })
             st.rerun()
 
@@ -407,14 +397,15 @@ with tab2:
 with tab3:
     st.subheader("請款明細確認")
 
-    if not st.session_state.items_v6:
+    if not st.session_state.items_v61:
         st.info("目前還沒有資料。")
     else:
-        df = pd.DataFrame(st.session_state.items_v6)
+        df = pd.DataFrame(st.session_state.items_v61)
 
         expected = [
-            "document_type", "date", "reference_no", "summary", "amount",
-            "payment_method", "location", "plate_no", "source", "barcode_raw",
+            "filename", "document_type", "date", "reference_no",
+            "summary", "amount", "payment_method", "location",
+            "plate_no", "source", "barcode_raw",
         ]
         for col in expected:
             if col not in df.columns:
@@ -428,6 +419,7 @@ with tab3:
             width="stretch",
             num_rows="dynamic",
             column_config={
+                "filename": st.column_config.TextColumn("照片", disabled=True),
                 "document_type": st.column_config.SelectboxColumn(
                     "單據類型",
                     options=["發票", "停車繳費單", "代收繳費單", "收據", "其他"],
@@ -444,26 +436,26 @@ with tab3:
                 "source": st.column_config.TextColumn("來源", disabled=True),
                 "barcode_raw": st.column_config.TextColumn("原始條碼", disabled=True),
             },
-            key="items_editor_v6",
+            key="items_editor_v61",
         )
 
-        st.session_state.items_v6 = edited.to_dict("records")
+        st.session_state.items_v61 = edited.to_dict("records")
 
         total = sum(
             int(float(x.get("amount", 0) or 0))
-            for x in st.session_state.items_v6
+            for x in st.session_state.items_v61
         )
 
         c1, c2 = st.columns(2)
-        c1.metric("目前筆數", len(st.session_state.items_v6))
+        c1.metric("目前筆數", len(st.session_state.items_v61))
         c2.metric("請款合計", f"${total:,}")
 
-        if len(st.session_state.items_v6) > MAX_ITEMS:
+        if len(st.session_state.items_v61) > MAX_ITEMS:
             st.error(f"目前 Excel 範本最多 {MAX_ITEMS} 筆，請刪除部分資料或分成兩張請款單。")
         else:
             try:
                 excel = write_excel(
-                    st.session_state.items_v6,
+                    st.session_state.items_v61,
                     department,
                     applicant,
                 )
@@ -479,16 +471,16 @@ with tab3:
                 st.error(f"Excel 產生失敗：{exc}")
 
         if st.button("🗑️ 清空本次請款資料", width="stretch"):
-            st.session_state.items_v6 = []
+            st.session_state.items_v61 = []
             st.rerun()
 
 
-with st.expander("ℹ️ V6 能做什麼"):
+with st.expander("ℹ️ V6.1 和 V6 的差別"):
     st.markdown("""
-- **電子發票**：QR Code 自動辨識發票號碼、日期、金額。
-- **停車繳費單 / 代收繳費單**：掃描 QR Code 與一維條碼，將條碼內容自動帶入。
-- **日期 / 金額**：只有條碼內容本身能明確判斷時才自動填，避免誤判。
-- **紙本中文文字**：V6 不使用大型 OCR，因此沒有條碼的內容請人工補登。
-- **手機使用**：支援直接拍照，也支援相簿上傳。
-- **Excel**：固定使用 template.xlsx，最多 8 筆，A4 橫向單頁列印。
+- 移除 `camera_input`，所以不會一進頁面就叫相機。
+- 改回 V5 類似的 `file_uploader` 操作。
+- 支援一次批量上傳多張照片。
+- 電子發票：QR 自動辨識。
+- 停車單 / 代收繳費單：QR + 一維條碼辨識。
+- 沒讀到條碼的照片，也會保留成一筆空白明細，方便你直接補資料。
 """)
